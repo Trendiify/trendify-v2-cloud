@@ -1212,10 +1212,6 @@ async function scannerResults(env) {
 /* VLESS over WebSocket                                                */
 /* ------------------------------------------------------------------ */
 
-// Fallback used when PROXYIP env / panel setting is empty.
-// This is a third-party host: replace it with your own proxy in Settings.
-const DEFAULT_PROXY_IPS = ["bpb.yousef.isegaro.com"];
-
 function uuidFromBytes(b) {
   const h = Array.from(b).map((x) => x.toString(16).padStart(2, "0")).join("");
   return (
@@ -1232,8 +1228,7 @@ function parseVLESS(view) {
   if (view.length < offset + 4) throw new Error("Invalid VLESS header");
 
   const command = view[offset++];
-  if (command !== 1 && command !== 2)
-    throw new Error("Unsupported command " + command + " (disable Mux in your client)");
+  if (command !== 1) throw new Error("Only TCP is supported");
 
   const port = (view[offset] << 8) | view[offset + 1];
   offset += 2;
@@ -1259,7 +1254,7 @@ function parseVLESS(view) {
   } else {
     throw new Error("Unsupported address type");
   }
-  return { version, uuid: uid, command, address, port, data: view.slice(offset) };
+  return { version, uuid: uid, address, port, data: view.slice(offset) };
 }
 
 function withTimeout(promise, ms, msg) {
@@ -1277,44 +1272,43 @@ async function getProxyList(env) {
       raw = (await getSetting(env, "proxy_ip")) || "";
     } catch {}
   }
-  const list = raw.split(",").map((s) => s.trim()).filter(Boolean);
-  return list.length ? list : DEFAULT_PROXY_IPS;
+  return raw.split(",").map((s) => s.trim()).filter(Boolean);
 }
 
-function parseProxy(p, defPort) {
-  const idx = p.lastIndexOf(":");
-  const hasPort = idx > 0 && p.indexOf(":") === idx && /^\d+$/.test(p.slice(idx + 1));
-  return {
-    host: hasPort ? p.slice(0, idx) : p,
-    port: hasPort ? Number(p.slice(idx + 1)) : defPort
-  };
-}
-
-async function connectTo(host, port) {
-  const s = connect({ hostname: host, port });
+async function openRemote(address, port, env) {
+  let directError = "";
   try {
+    const s = connect({ hostname: address, port });
     await withTimeout(s.opened, 8000, "connect timeout");
+    return { socket: s, via: "direct" };
   } catch (e) {
-    try { s.close(); } catch {}
-    throw e;
+    directError = e && e.message ? e.message : String(e);
   }
-  return s;
+
+  const proxies = await getProxyList(env);
+  for (const p of proxies) {
+    let s;
+    try {
+      const idx = p.lastIndexOf(":");
+      const hasPort = idx > 0 && /^\d+$/.test(p.slice(idx + 1)) && p.indexOf(":") === idx;
+      const ph = hasPort ? p.slice(0, idx) : p;
+      const pp = hasPort ? Number(p.slice(idx + 1)) : port;
+      s = connect({ hostname: ph, port: pp });
+      await withTimeout(s.opened, 8000, "proxy connect timeout");
+      return { socket: s, via: "proxy " + p };
+    } catch {
+      try {
+        s && s.close();
+      } catch {}
+    }
+  }
+  throw new Error("connect failed " + address + ":" + port + " (" + directError + ")");
 }
 
-async function toUint8(data) {
+function toUint8(data) {
   if (data instanceof ArrayBuffer) return new Uint8Array(data);
-  if (ArrayBuffer.isView(data)) {
-    return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
-  }
-  if (typeof Blob !== "undefined" && data instanceof Blob) {
-    return new Uint8Array(await data.arrayBuffer());
-  }
-  if (typeof data === "string") {
-    const e = new Error("Text frame received (len " + data.length + ", starts: " +
-      JSON.stringify(data.slice(0, 20)) + ")");
-    throw e;
-  }
-  throw new Error("Unknown WebSocket data type: " + Object.prototype.toString.call(data));
+  if (ArrayBuffer.isView(data)) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+  throw new Error("Binary WebSocket data required");
 }
 
 function handleVLESS(request, env, ctx, pathGatewayId) {
@@ -1327,16 +1321,9 @@ function handleVLESS(request, env, ctx, pathGatewayId) {
   let writer = null;
   let headerSent = false;
   let closed = false;
-  let started = false;
-  let isUdp = false;
-  let udpBuf = new Uint8Array(0);
   let pending = 0;
   let userId = 0;
   let version = 0;
-  let target = null;
-  let firstData = new Uint8Array(0);
-  let retried = false;
-  let retrying = null;
   let effectiveGateway = pathGatewayId || 0;
   let chain = Promise.resolve();
 
@@ -1369,110 +1356,6 @@ function handleVLESS(request, env, ctx, pathGatewayId) {
     e.quiet = !!quiet;
     throw e;
   };
- 
-  // send bytes to the client, prefixing the VLESS response header once
-  const send = (chunk) => {
-    if (closed || server.readyState !== 1) return;
-    try {
-      if (!headerSent) {
-        headerSent = true;
-        const out = new Uint8Array(2 + chunk.byteLength);
-        out[0] = version;
-        out[1] = 0;
-        out.set(chunk, 2);
-        server.send(out);
-      } else {
-        server.send(chunk);
-      }
-    } catch {}
-  };
-
-  function pipeRemote(sock, canRetry) {
-    let got = false;
-    sock.readable
-      .pipeTo(
-        new WritableStream({
-          write(chunk) {
-            if (closed) return;
-            got = true;
-            pending += chunk.byteLength;
-            send(chunk);
-            if (pending > 5 * 1024 * 1024) flush();
-          }
-        })
-      )
-      .catch(() => {})
-      .finally(() => {
-        if (closed || remote !== sock) return;
-        // connected but got nothing back (typical for Cloudflare-hosted targets) -> retry via proxy
-        if (!got && canRetry && !retried) {
-          retried = true;
-          retrying = (async () => {
-            try { writer.releaseLock(); } catch {}
-            try { sock.close(); } catch {}
-            const ok = await tryProxies();
-            if (!ok) closeAll();
-          })();
-        } else {
-          closeAll();
-        }
-      });
-  }
-
-  async function attachRemote(sock, canRetry) {
-    const w = sock.writable.getWriter();
-    if (firstData.length > 0) await w.write(firstData);
-    remote = sock;
-    writer = w;
-    pipeRemote(sock, canRetry);
-  }
-
-  async function tryProxies() {
-    const proxies = await getProxyList(env);
-    for (const p of proxies) {
-      const pr = parseProxy(p, target.port);
-      let s = null;
-      try {
-        s = await connectTo(pr.host, pr.port);
-        await attachRemote(s, false);
-        logEvent(env, ctx, effectiveGateway, "CONNECT_VIA_PROXY", p + " -> " + target.address + ":" + target.port);
-        return true;
-      } catch {
-        try { s && s.close(); } catch {}
-      }
-    }
-    return false;
-  }
-
-  // UDP is only supported for DNS (port 53); queries are answered via DoH
-  async function handleUdp(data) {
-    const merged = new Uint8Array(udpBuf.length + data.length);
-    merged.set(udpBuf, 0);
-    merged.set(data, udpBuf.length);
-    let off = 0;
-    while (merged.length - off >= 2) {
-      const len = (merged[off] << 8) | merged[off + 1];
-      if (merged.length - off - 2 < len) break;
-      const q = merged.slice(off + 2, off + 2 + len);
-      off += 2 + len;
-      pending += q.length;
-      try {
-        const resp = await fetch("https://1.1.1.1/dns-query", {
-          method: "POST",
-          headers: { "content-type": "application/dns-message", accept: "application/dns-message" },
-          body: q
-        });
-        const ans = new Uint8Array(await resp.arrayBuffer());
-        const out = new Uint8Array(2 + ans.length);
-        out[0] = (ans.length >> 8) & 255;
-        out[1] = ans.length & 255;
-        out.set(ans, 2);
-        pending += ans.length;
-        send(out);
-      } catch {}
-    }
-    udpBuf = merged.slice(off);
-  }
 
   async function onFirstPacket(data) {
     const p = parseVLESS(data);
@@ -1484,7 +1367,7 @@ function handleVLESS(request, env, ctx, pathGatewayId) {
       .bind(p.uuid)
       .first();
 
-    if (!user) reject("Invalid UUID " + p.uuid);
+    if (!user) reject("Invalid UUID", true);
     if (Number(user.enabled) !== 1) reject("Account disabled");
 
     if (pathGatewayId && user.gateway_id && Number(user.gateway_id) !== pathGatewayId)
@@ -1507,50 +1390,51 @@ function handleVLESS(request, env, ctx, pathGatewayId) {
 
     userId = Number(user.id);
     version = p.version;
-    target = { address: p.address, port: p.port };
-    firstData = p.data;
 
-    if (p.command === 2) {
-      if (p.port !== 53) reject("UDP is only supported for DNS (port 53)");
-      isUdp = true;
-      // reply header immediately so the client knows the tunnel is up
-      send(new Uint8Array(0));
-      if (p.data.length) await handleUdp(p.data);
-      return;
+    const opened = await openRemote(p.address, p.port, env);
+    remote = opened.socket;
+    if (opened.via !== "direct") {
+      logEvent(env, ctx, effectiveGateway, "CONNECT_VIA_PROXY", opened.via + " -> " + p.address + ":" + p.port);
     }
 
-    pending += firstData.length;
+    writer = remote.writable.getWriter();
+    if (p.data.length > 0) {
+      pending += p.data.length;
+      await writer.write(p.data);
+    }
 
-    let connected = false;
-    let directError = "";
-    try {
-      const s = await connectTo(p.address, p.port);
-      await attachRemote(s, true);
-      connected = true;
-    } catch (e) {
-      directError = e && e.message ? e.message : String(e);
-    }
-    if (!connected) {
-      retried = true;
-      if (!(await tryProxies()))
-        reject("connect failed " + p.address + ":" + p.port + " (" + directError + ")");
-    }
+    remote.readable
+      .pipeTo(
+        new WritableStream({
+          write(chunk) {
+            if (closed) return;
+            pending += chunk.byteLength;
+            if (!headerSent) {
+              headerSent = true;
+              const out = new Uint8Array(2 + chunk.byteLength);
+              out[0] = version;
+              out[1] = 0;
+              out.set(chunk, 2);
+              server.send(out);
+            } else {
+              server.send(chunk);
+            }
+            if (pending > 5 * 1024 * 1024) flush();
+          }
+        })
+      )
+      .catch(() => {})
+      .finally(closeAll);
   }
 
   server.addEventListener("message", (event) => {
-    
     chain = chain
       .then(async () => {
         if (closed) return;
-        const data = await toUint8(event.data);
-        if (!started) {
-          started = true;
+        const data = toUint8(event.data);
+        if (!writer) {
           await onFirstPacket(data);
-        } else if (isUdp) {
-          await handleUdp(data);
         } else {
-          if (retrying) await retrying;
-          if (!writer) return;
           pending += data.byteLength;
           await writer.write(data);
         }
@@ -1582,20 +1466,13 @@ function app() {
 <title>Trendify Nexus</title>
 <style>
 *{box-sizing:border-box}
-:root{--logo:url("https://raw.githubusercontent.com/Trendiify/trendify-v2-cloud/main/logo/Untitled%20design.png")}
-body{
-  background-color:#070b14;
-  background-image:linear-gradient(rgba(7,11,20,.75),rgba(7,11,20,.75)),url("https://raw.githubusercontent.com/Trendiify/trendify-v2-cloud/main/logo/6ed1ab4d-e489-42dc-8eff-36d1e07024a0.png");
-  background-size:cover;
-  background-position:center;
-  background-attachment:fixed;
-}
+html,body{margin:0;padding:0;min-height:100%;background:#070b14;color:#f5f7fb;font-family:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}
 button,input,select,textarea{font:inherit}
 button{cursor:pointer}
 .layout{min-height:100vh;display:flex}
 .sidebar{width:230px;background:#0a101c;border-right:1px solid #1b2638;padding:18px;position:fixed;left:0;top:0;bottom:0;overflow-y:auto}
 .brand{display:flex;gap:12px;align-items:center;margin-bottom:26px}
-.logo{width:40px;height:40px;border-radius:10px;background:var(--logo) center/contain no-repeat;color:transparent;font-size:0;flex:none}
+.logo{width:40px;height:40px;border-radius:12px;display:grid;place-items:center;background:linear-gradient(135deg,#f59e0b,#facc15);color:#111827;font-weight:900}
 .brand-title{font-weight:900}
 .brand-sub{color:#7f8da5;font-size:12px;margin-top:3px}
 .nav{display:grid;gap:6px}
@@ -1651,21 +1528,8 @@ td{font-size:13px}
 .login-wrap{min-height:100vh;display:grid;place-items:center;padding:20px}
 .login-box{width:min(420px,100%);background:#0c1422;border:1px solid #1d2a3e;border-radius:17px;padding:25px}
 .login-box h1{margin:0 0 7px}
-.login-logo{width:84px;height:84px;margin:0 auto 14px;background:var(--logo) center/contain no-repeat}
-.login-box{text-align:center}
-.login-box .field{text-align:left}
 .login-box p{color:#7d8ba2;font-size:13px;margin:0 0 20px}
 .login-form{display:grid;gap:12px}
-body,h1,h2,h3,p,span,div,td,th,label,strong,a,li{color:#fff}
-.muted,.topbar p,.brand-sub,.card-label,th,.field label,.empty,.login-box p{color:#e6ebf5}
-.field input,.field select,.field textarea,.btn,.icon-btn,.nav button{color:#fff}
-select option{background:#0c1422;color:#fff}
-::placeholder{color:#b8c2d6}
-.btn.primary{color:#111827}
-.badge.green{color:#8dffb8}
-.badge.red{color:#ffb0b6}
-.badge.yellow{color:#ffe58a}
-.icon-btn.danger{color:#ffb0b6}
 @media(max-width:900px){
  .sidebar{width:64px;padding:12px 8px}
  .brand-title,.brand-sub,.nav .lbl{display:none}
@@ -1775,16 +1639,15 @@ select option{background:#0c1422;color:#fff}
       if (el) el.innerHTML = '<div class="empty">' + esc(e.message || 'Failed') + '</div>';
     };
   }
-    
 
   function val(id) { var el = $(id); return el ? el.value : ''; }
 
   /* ---------- login / shell ---------- */
 
-      function showLogin() {
+  function showLogin() {
     closeModal();
     root.innerHTML =
-      '<div class="login-wrap"><div class="login-box"><div class="login-logo"></div><h1>Trendify Nexus</h1><p>Cloudflare Control Panel</p>' +
+      '<div class="login-wrap"><div class="login-box"><h1>Trendify Nexus</h1><p>Cloudflare Control Panel</p>' +
       '<form class="login-form" data-form="login">' +
       '<div class="field"><label>Username</label><input id="loginUsername" value="admin" autocomplete="username"></div>' +
       '<div class="field"><label>Password</label><input id="loginPassword" type="password" autocomplete="current-password"></div>' +
@@ -2309,7 +2172,7 @@ select option{background:#0c1422;color:#fff}
 
   api('/api/auth/me').then(function (me) { S.me = me; showShell(); }).catch(function () { showLogin(); });
 })();
-</script> 
+</script>
 </body>
 </html>`;
 }
