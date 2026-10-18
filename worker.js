@@ -1212,6 +1212,10 @@ async function scannerResults(env) {
 /* VLESS over WebSocket                                                */
 /* ------------------------------------------------------------------ */
 
+// Fallback used when PROXYIP env / panel setting is empty.
+// This is a third-party host: replace it with your own proxy in Settings.
+const DEFAULT_PROXY_IPS = ["bpb.yousef.isegaro.com"];
+
 function uuidFromBytes(b) {
   const h = Array.from(b).map((x) => x.toString(16).padStart(2, "0")).join("");
   return (
@@ -1228,7 +1232,8 @@ function parseVLESS(view) {
   if (view.length < offset + 4) throw new Error("Invalid VLESS header");
 
   const command = view[offset++];
-  if (command !== 1) throw new Error("Only TCP is supported");
+  if (command !== 1 && command !== 2)
+    throw new Error("Unsupported command " + command + " (disable Mux in your client)");
 
   const port = (view[offset] << 8) | view[offset + 1];
   offset += 2;
@@ -1254,7 +1259,7 @@ function parseVLESS(view) {
   } else {
     throw new Error("Unsupported address type");
   }
-  return { version, uuid: uid, address, port, data: view.slice(offset) };
+  return { version, uuid: uid, command, address, port, data: view.slice(offset) };
 }
 
 function withTimeout(promise, ms, msg) {
@@ -1272,43 +1277,44 @@ async function getProxyList(env) {
       raw = (await getSetting(env, "proxy_ip")) || "";
     } catch {}
   }
-  return raw.split(",").map((s) => s.trim()).filter(Boolean);
+  const list = raw.split(",").map((s) => s.trim()).filter(Boolean);
+  return list.length ? list : DEFAULT_PROXY_IPS;
 }
 
-async function openRemote(address, port, env) {
-  let directError = "";
+function parseProxy(p, defPort) {
+  const idx = p.lastIndexOf(":");
+  const hasPort = idx > 0 && p.indexOf(":") === idx && /^\d+$/.test(p.slice(idx + 1));
+  return {
+    host: hasPort ? p.slice(0, idx) : p,
+    port: hasPort ? Number(p.slice(idx + 1)) : defPort
+  };
+}
+
+async function connectTo(host, port) {
+  const s = connect({ hostname: host, port });
   try {
-    const s = connect({ hostname: address, port });
     await withTimeout(s.opened, 8000, "connect timeout");
-    return { socket: s, via: "direct" };
   } catch (e) {
-    directError = e && e.message ? e.message : String(e);
+    try { s.close(); } catch {}
+    throw e;
   }
-
-  const proxies = await getProxyList(env);
-  for (const p of proxies) {
-    let s;
-    try {
-      const idx = p.lastIndexOf(":");
-      const hasPort = idx > 0 && /^\d+$/.test(p.slice(idx + 1)) && p.indexOf(":") === idx;
-      const ph = hasPort ? p.slice(0, idx) : p;
-      const pp = hasPort ? Number(p.slice(idx + 1)) : port;
-      s = connect({ hostname: ph, port: pp });
-      await withTimeout(s.opened, 8000, "proxy connect timeout");
-      return { socket: s, via: "proxy " + p };
-    } catch {
-      try {
-        s && s.close();
-      } catch {}
-    }
-  }
-  throw new Error("connect failed " + address + ":" + port + " (" + directError + ")");
+  return s;
 }
 
-function toUint8(data) {
+async function toUint8(data) {
   if (data instanceof ArrayBuffer) return new Uint8Array(data);
-  if (ArrayBuffer.isView(data)) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
-  throw new Error("Binary WebSocket data required");
+  if (ArrayBuffer.isView(data)) {
+    return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+  }
+  if (typeof Blob !== "undefined" && data instanceof Blob) {
+    return new Uint8Array(await data.arrayBuffer());
+  }
+  if (typeof data === "string") {
+    const e = new Error("Text frame received (len " + data.length + ", starts: " +
+      JSON.stringify(data.slice(0, 20)) + ")");
+    throw e;
+  }
+  throw new Error("Unknown WebSocket data type: " + Object.prototype.toString.call(data));
 }
 
 function handleVLESS(request, env, ctx, pathGatewayId) {
@@ -1321,9 +1327,16 @@ function handleVLESS(request, env, ctx, pathGatewayId) {
   let writer = null;
   let headerSent = false;
   let closed = false;
+  let started = false;
+  let isUdp = false;
+  let udpBuf = new Uint8Array(0);
   let pending = 0;
   let userId = 0;
   let version = 0;
+  let target = null;
+  let firstData = new Uint8Array(0);
+  let retried = false;
+  let retrying = null;
   let effectiveGateway = pathGatewayId || 0;
   let chain = Promise.resolve();
 
@@ -1356,6 +1369,110 @@ function handleVLESS(request, env, ctx, pathGatewayId) {
     e.quiet = !!quiet;
     throw e;
   };
+ 
+  // send bytes to the client, prefixing the VLESS response header once
+  const send = (chunk) => {
+    if (closed || server.readyState !== 1) return;
+    try {
+      if (!headerSent) {
+        headerSent = true;
+        const out = new Uint8Array(2 + chunk.byteLength);
+        out[0] = version;
+        out[1] = 0;
+        out.set(chunk, 2);
+        server.send(out);
+      } else {
+        server.send(chunk);
+      }
+    } catch {}
+  };
+
+  function pipeRemote(sock, canRetry) {
+    let got = false;
+    sock.readable
+      .pipeTo(
+        new WritableStream({
+          write(chunk) {
+            if (closed) return;
+            got = true;
+            pending += chunk.byteLength;
+            send(chunk);
+            if (pending > 5 * 1024 * 1024) flush();
+          }
+        })
+      )
+      .catch(() => {})
+      .finally(() => {
+        if (closed || remote !== sock) return;
+        // connected but got nothing back (typical for Cloudflare-hosted targets) -> retry via proxy
+        if (!got && canRetry && !retried) {
+          retried = true;
+          retrying = (async () => {
+            try { writer.releaseLock(); } catch {}
+            try { sock.close(); } catch {}
+            const ok = await tryProxies();
+            if (!ok) closeAll();
+          })();
+        } else {
+          closeAll();
+        }
+      });
+  }
+
+  async function attachRemote(sock, canRetry) {
+    const w = sock.writable.getWriter();
+    if (firstData.length > 0) await w.write(firstData);
+    remote = sock;
+    writer = w;
+    pipeRemote(sock, canRetry);
+  }
+
+  async function tryProxies() {
+    const proxies = await getProxyList(env);
+    for (const p of proxies) {
+      const pr = parseProxy(p, target.port);
+      let s = null;
+      try {
+        s = await connectTo(pr.host, pr.port);
+        await attachRemote(s, false);
+        logEvent(env, ctx, effectiveGateway, "CONNECT_VIA_PROXY", p + " -> " + target.address + ":" + target.port);
+        return true;
+      } catch {
+        try { s && s.close(); } catch {}
+      }
+    }
+    return false;
+  }
+
+  // UDP is only supported for DNS (port 53); queries are answered via DoH
+  async function handleUdp(data) {
+    const merged = new Uint8Array(udpBuf.length + data.length);
+    merged.set(udpBuf, 0);
+    merged.set(data, udpBuf.length);
+    let off = 0;
+    while (merged.length - off >= 2) {
+      const len = (merged[off] << 8) | merged[off + 1];
+      if (merged.length - off - 2 < len) break;
+      const q = merged.slice(off + 2, off + 2 + len);
+      off += 2 + len;
+      pending += q.length;
+      try {
+        const resp = await fetch("https://1.1.1.1/dns-query", {
+          method: "POST",
+          headers: { "content-type": "application/dns-message", accept: "application/dns-message" },
+          body: q
+        });
+        const ans = new Uint8Array(await resp.arrayBuffer());
+        const out = new Uint8Array(2 + ans.length);
+        out[0] = (ans.length >> 8) & 255;
+        out[1] = ans.length & 255;
+        out.set(ans, 2);
+        pending += ans.length;
+        send(out);
+      } catch {}
+    }
+    udpBuf = merged.slice(off);
+  }
 
   async function onFirstPacket(data) {
     const p = parseVLESS(data);
@@ -1367,7 +1484,7 @@ function handleVLESS(request, env, ctx, pathGatewayId) {
       .bind(p.uuid)
       .first();
 
-    if (!user) reject("Invalid UUID", true);
+    if (!user) reject("Invalid UUID " + p.uuid);
     if (Number(user.enabled) !== 1) reject("Account disabled");
 
     if (pathGatewayId && user.gateway_id && Number(user.gateway_id) !== pathGatewayId)
@@ -1390,51 +1507,50 @@ function handleVLESS(request, env, ctx, pathGatewayId) {
 
     userId = Number(user.id);
     version = p.version;
+    target = { address: p.address, port: p.port };
+    firstData = p.data;
 
-    const opened = await openRemote(p.address, p.port, env);
-    remote = opened.socket;
-    if (opened.via !== "direct") {
-      logEvent(env, ctx, effectiveGateway, "CONNECT_VIA_PROXY", opened.via + " -> " + p.address + ":" + p.port);
+    if (p.command === 2) {
+      if (p.port !== 53) reject("UDP is only supported for DNS (port 53)");
+      isUdp = true;
+      // reply header immediately so the client knows the tunnel is up
+      send(new Uint8Array(0));
+      if (p.data.length) await handleUdp(p.data);
+      return;
     }
 
-    writer = remote.writable.getWriter();
-    if (p.data.length > 0) {
-      pending += p.data.length;
-      await writer.write(p.data);
-    }
+    pending += firstData.length;
 
-    remote.readable
-      .pipeTo(
-        new WritableStream({
-          write(chunk) {
-            if (closed) return;
-            pending += chunk.byteLength;
-            if (!headerSent) {
-              headerSent = true;
-              const out = new Uint8Array(2 + chunk.byteLength);
-              out[0] = version;
-              out[1] = 0;
-              out.set(chunk, 2);
-              server.send(out);
-            } else {
-              server.send(chunk);
-            }
-            if (pending > 5 * 1024 * 1024) flush();
-          }
-        })
-      )
-      .catch(() => {})
-      .finally(closeAll);
+    let connected = false;
+    let directError = "";
+    try {
+      const s = await connectTo(p.address, p.port);
+      await attachRemote(s, true);
+      connected = true;
+    } catch (e) {
+      directError = e && e.message ? e.message : String(e);
+    }
+    if (!connected) {
+      retried = true;
+      if (!(await tryProxies()))
+        reject("connect failed " + p.address + ":" + p.port + " (" + directError + ")");
+    }
   }
 
   server.addEventListener("message", (event) => {
+    
     chain = chain
       .then(async () => {
         if (closed) return;
-        const data = toUint8(event.data);
-        if (!writer) {
+        const data = await toUint8(event.data);
+        if (!started) {
+          started = true;
           await onFirstPacket(data);
+        } else if (isUdp) {
+          await handleUdp(data);
         } else {
+          if (retrying) await retrying;
+          if (!writer) return;
           pending += data.byteLength;
           await writer.write(data);
         }
