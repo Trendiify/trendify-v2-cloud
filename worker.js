@@ -1582,13 +1582,20 @@ function app() {
 <title>Trendify Nexus</title>
 <style>
 *{box-sizing:border-box}
-html,body{margin:0;padding:0;min-height:100%;background:#070b14;color:#f5f7fb;font-family:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}
+:root{--logo:url("https://raw.githubusercontent.com/Trendiify/trendify-v2-cloud/main/logo/Untitled%20design.png")}
+body{
+  background-color:#070b14;
+  background-image:linear-gradient(rgba(7,11,20,.75),rgba(7,11,20,.75)),url("https://raw.githubusercontent.com/Trendiify/trendify-v2-cloud/main/logo/6ed1ab4d-e489-42dc-8eff-36d1e07024a0.png");
+  background-size:cover;
+  background-position:center;
+  background-attachment:fixed;
+}
 button,input,select,textarea{font:inherit}
 button{cursor:pointer}
 .layout{min-height:100vh;display:flex}
 .sidebar{width:230px;background:#0a101c;border-right:1px solid #1b2638;padding:18px;position:fixed;left:0;top:0;bottom:0;overflow-y:auto}
 .brand{display:flex;gap:12px;align-items:center;margin-bottom:26px}
-.logo{width:40px;height:40px;border-radius:12px;display:grid;place-items:center;background:linear-gradient(135deg,#f59e0b,#facc15);color:#111827;font-weight:900}
+.logo{width:40px;height:40px;border-radius:10px;background:var(--logo) center/contain no-repeat;color:transparent;font-size:0;flex:none}
 .brand-title{font-weight:900}
 .brand-sub{color:#7f8da5;font-size:12px;margin-top:3px}
 .nav{display:grid;gap:6px}
@@ -1644,8 +1651,21 @@ td{font-size:13px}
 .login-wrap{min-height:100vh;display:grid;place-items:center;padding:20px}
 .login-box{width:min(420px,100%);background:#0c1422;border:1px solid #1d2a3e;border-radius:17px;padding:25px}
 .login-box h1{margin:0 0 7px}
+.login-logo{width:84px;height:84px;margin:0 auto 14px;background:var(--logo) center/contain no-repeat}
+.login-box{text-align:center}
+.login-box .field{text-align:left}
 .login-box p{color:#7d8ba2;font-size:13px;margin:0 0 20px}
 .login-form{display:grid;gap:12px}
+body,h1,h2,h3,p,span,div,td,th,label,strong,a,li{color:#fff}
+.muted,.topbar p,.brand-sub,.card-label,th,.field label,.empty,.login-box p{color:#e6ebf5}
+.field input,.field select,.field textarea,.btn,.icon-btn,.nav button{color:#fff}
+select option{background:#0c1422;color:#fff}
+::placeholder{color:#b8c2d6}
+.btn.primary{color:#111827}
+.badge.green{color:#8dffb8}
+.badge.red{color:#ffb0b6}
+.badge.yellow{color:#ffe58a}
+.icon-btn.danger{color:#ffb0b6}
 @media(max-width:900px){
  .sidebar{width:64px;padding:12px 8px}
  .brand-title,.brand-sub,.nav .lbl{display:none}
@@ -1755,15 +1775,16 @@ td{font-size:13px}
       if (el) el.innerHTML = '<div class="empty">' + esc(e.message || 'Failed') + '</div>';
     };
   }
+    
 
   function val(id) { var el = $(id); return el ? el.value : ''; }
 
   /* ---------- login / shell ---------- */
 
-  function showLogin() {
+      function showLogin() {
     closeModal();
     root.innerHTML =
-      '<div class="login-wrap"><div class="login-box"><h1>Trendify Nexus</h1><p>Cloudflare Control Panel</p>' +
+      '<div class="login-wrap"><div class="login-box"><div class="login-logo"></div><h1>Trendify Nexus</h1><p>Cloudflare Control Panel</p>' +
       '<form class="login-form" data-form="login">' +
       '<div class="field"><label>Username</label><input id="loginUsername" value="admin" autocomplete="username"></div>' +
       '<div class="field"><label>Password</label><input id="loginPassword" type="password" autocomplete="current-password"></div>' +
@@ -2288,7 +2309,7 @@ td{font-size:13px}
 
   api('/api/auth/me').then(function (me) { S.me = me; showShell(); }).catch(function () { showLogin(); });
 })();
-</script>
+</script> 
 </body>
 </html>`;
 }
