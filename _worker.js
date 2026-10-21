@@ -490,6 +490,10 @@ export default {
         if (method === "DELETE") return await deleteGateway(id, env);
       }
       m = path.match(/^\/api\/gateways\/(\d+)\/health-result$/);
+      m = path.match(/^\/api\/gateways\/(\d+)\/redeploy$/);
+      if (m && method === "POST") return await redeployGateway(Number(m[1]), env);
+      if (path === "/api/cfdeploy" && method === "GET") return await cfdGet(env);
+      if (path === "/api/cfdeploy" && method === "POST") return await cfdSave(request, env);
       if (m && method === "POST") return await saveHealth(Number(m[1]), request, env);
 
       // subscriptions
@@ -1015,19 +1019,35 @@ async function createGateway(request, env, url) {
   const f = readGatewayFields(body, url);
   if (f.error) return json({ success: false, error: f.error }, 400);
 
+  let host = f.host;
+  let workerName = "gw-" + randomString(10);
+
+  if (body.deploy) {
+    const c = await cfdConfig(env);
+    if (!c.token || !c.accountId || !c.dbId)
+      return json({ success: false, error: "Configure Worker gateways in Settings first" }, 400);
+    workerName = GW_PREFIX + randomString(8);
+    try {
+      await cfdUpload(c, workerName);
+      host = await cfdSubdomain(c, workerName);
+    } catch (e) {
+      await cfdRemove(c, workerName);
+      return json({ success: false, error: "Deploy failed: " + (e && e.message ? e.message : String(e)) }, 400);
+    }
+  }
+
   const r = await env.DB.prepare(
     `INSERT INTO gateways (name, worker_name, worker_url, enabled, region, status)
      VALUES (?, ?, ?, 1, ?, 'unknown')`
   )
-    .bind(f.name, "gw-" + randomString(10), f.host, f.region)
+    .bind(f.name, workerName, host, f.region)
     .run();
 
   return json({
     success: true,
-    gateway: { id: r.meta && r.meta.last_row_id, name: f.name, host: f.host, region: f.region }
+    gateway: { id: r.meta && r.meta.last_row_id, name: f.name, host, region: f.region }
   });
 }
-
 async function updateGateway(id, request, env, url) {
   const body = await readJson(request);
   if (!body) return json({ success: false, error: "Invalid JSON" }, 400);
@@ -1052,11 +1072,16 @@ async function toggleGateway(id, env) {
   return json({ success: true, enabled });
 }
 
-async function deleteGateway(id, env) {
+aasync function deleteGateway(id, env) {
+  const g = await env.DB.prepare("SELECT worker_name FROM gateways WHERE id = ? LIMIT 1").bind(id).first();
   await env.DB.batch([
     env.DB.prepare("UPDATE accounts SET gateway_id = NULL WHERE gateway_id = ?").bind(id),
     env.DB.prepare("DELETE FROM gateways WHERE id = ?").bind(id)
   ]);
+  if (g && String(g.worker_name).startsWith(GW_PREFIX)) {
+    const c = await cfdConfig(env);
+    if (c.token && c.accountId) await cfdRemove(c, g.worker_name);
+  }
   return json({ success: true });
 }
 
@@ -2271,6 +2296,157 @@ async function tgOnText(env, t, st, text) {
   return tgMain(t);
 }
 /* ------------------------------------------------------------------ */
+/* Worker gateways (deployed through the Cloudflare API)               */
+/* ------------------------------------------------------------------ */
+
+const CF_API = "https://api.cloudflare.com/client/v4";
+const GW_SOURCE_DEFAULT =
+  "https://raw.githubusercontent.com/Trendiify/trendify-v2-cloud/main/_worker.js";
+const GW_COMPAT = "2025-01-01";
+const GW_PREFIX = "nexus-gw-";
+
+async function cfApi(token, path, opts = {}) {
+  const r = await fetch(CF_API + path, {
+    ...opts,
+    headers: { Authorization: "Bearer " + token, ...(opts.headers || {}) }
+  });
+  const j = await r.json().catch(() => null);
+  if (!r.ok || !j || j.success === false) {
+    const msg = j && j.errors && j.errors.length
+      ? j.errors.map((e) => e.message + (e.code ? " (" + e.code + ")" : "")).join("; ")
+      : "HTTP " + r.status;
+    const e = new Error(msg);
+    e.status = r.status;
+    throw e;
+  }
+  return j.result;
+}
+
+async function cfdConfig(env) {
+  const g = async (k) => (await getSetting(env, k)) || "";
+  return {
+    token: env.CF_API_TOKEN ? String(env.CF_API_TOKEN) : await g("cfd_token"),
+    accountId: env.CF_ACCOUNT_ID ? String(env.CF_ACCOUNT_ID) : await g("cfd_account"),
+    dbId: env.CF_DB_ID ? String(env.CF_DB_ID) : await g("cfd_db"),
+    source: (await g("cfd_source")) || GW_SOURCE_DEFAULT,
+    fromEnv: !!env.CF_API_TOKEN
+  };
+}
+
+async function cfdGet(env) {
+  const c = await cfdConfig(env);
+  return json({
+    success: true,
+    cfd: {
+      token_set: !!c.token,
+      from_env: c.fromEnv,
+      account_id: c.accountId,
+      db_id: c.dbId,
+      source: c.source
+    }
+  });
+}
+
+async function cfdSave(request, env) {
+  const body = await readJson(request);
+  if (!body) return json({ success: false, error: "Invalid JSON" }, 400);
+
+  if (body.clear) {
+    for (const k of ["cfd_token", "cfd_account", "cfd_db"]) await setSetting(env, k, "");
+    return json({ success: true });
+  }
+
+  const src = String(body.source || "").trim();
+  if (src) {
+    if (!/^https:\/\/\S+$/.test(src)) return json({ success: false, error: "Code URL must start with https://" }, 400);
+    await setSetting(env, "cfd_source", src);
+  }
+
+  const cur = await cfdConfig(env);
+  const newToken = String(body.token || "").trim();
+  const token = newToken || cur.token;
+  if (!token) return json({ success: true });
+
+  let accountId = String(body.account_id || "").trim() || (newToken ? "" : cur.accountId);
+  let dbId = String(body.db_id || "").trim() || (newToken ? "" : cur.dbId);
+
+  try {
+    if (!accountId) {
+      const acc = await cfApi(token, "/accounts?per_page=50");
+      if (!acc.length) throw new Error("No account is accessible with this token");
+      if (acc.length > 1)
+        throw new Error("Several accounts found, enter Account ID: " + acc.map((a) => a.name + " = " + a.id).join(", "));
+      accountId = acc[0].id;
+    }
+    if (!dbId) {
+      const dbs = await cfApi(token, "/accounts/" + accountId + "/d1/database");
+      if (!dbs.length) throw new Error("No D1 database found");
+      if (dbs.length > 1)
+        throw new Error("Several databases found, enter D1 database ID: " + dbs.map((d) => d.name + " = " + d.uuid).join(", "));
+      dbId = dbs[0].uuid;
+    }
+    if (!UUID_RE.test(dbId)) throw new Error("Invalid database ID");
+    await cfApi(token, "/accounts/" + accountId + "/workers/subdomain");
+  } catch (e) {
+    return json({ success: false, error: e && e.message ? e.message : String(e) }, 400);
+  }
+
+  if (newToken) await setSetting(env, "cfd_token", newToken);
+  await setSetting(env, "cfd_account", accountId);
+  await setSetting(env, "cfd_db", dbId);
+  return json({ success: true, account_id: accountId, db_id: dbId });
+}
+
+async function cfdUpload(c, name) {
+  const r = await fetch(c.source, { cf: { cacheTtl: 0 } });
+  if (!r.ok) throw new Error("Could not download panel code (HTTP " + r.status + ")");
+  const code = await r.text();
+  if (code.length < 2000 || code.indexOf("export default") === -1)
+    throw new Error("Downloaded file does not look like the panel code");
+
+  const meta = {
+    main_module: "worker.js",
+    compatibility_date: GW_COMPAT,
+    bindings: [{ type: "d1", name: "DB", id: c.dbId }]
+  };
+  const form = new FormData();
+  form.append("metadata", new File([JSON.stringify(meta)], "metadata.json", { type: "application/json" }));
+  form.append("worker.js", new File([code], "worker.js", { type: "application/javascript+module" }));
+  await cfApi(c.token, "/accounts/" + c.accountId + "/workers/scripts/" + name, { method: "PUT", body: form });
+}
+
+async function cfdSubdomain(c, name) {
+  await cfApi(c.token, "/accounts/" + c.accountId + "/workers/scripts/" + name + "/subdomain", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ enabled: true })
+  });
+  const s = await cfApi(c.token, "/accounts/" + c.accountId + "/workers/subdomain");
+  return name + "." + s.subdomain + ".workers.dev";
+}
+
+async function cfdRemove(c, name) {
+  try {
+    await cfApi(c.token, "/accounts/" + c.accountId + "/workers/scripts/" + name + "?force=true", { method: "DELETE" });
+  } catch {}
+}
+
+async function redeployGateway(id, env) {
+  const g = await env.DB.prepare("SELECT worker_name FROM gateways WHERE id = ? LIMIT 1").bind(id).first();
+  if (!g) return json({ success: false, error: "Gateway not found" }, 404);
+  if (!String(g.worker_name).startsWith(GW_PREFIX))
+    return json({ success: false, error: "This gateway is not a deployed Worker" }, 400);
+  const c = await cfdConfig(env);
+  if (!c.token || !c.accountId || !c.dbId)
+    return json({ success: false, error: "Configure Worker gateways in Settings first" }, 400);
+  try {
+    await cfdUpload(c, g.worker_name);
+  } catch (e) {
+    return json({ success: false, error: e && e.message ? e.message : String(e) }, 400);
+  }
+  return json({ success: true });
+}
+/* ------------------------------------------------------------------ */
 /* panel UI                                                            */
 /* ------------------------------------------------------------------ */
 
@@ -2686,6 +2862,7 @@ select option{background:#0c1422;color:#fff}
           '<td><span class="badge ' + (on ? 'green' : 'red') + '">' + (on ? 'Enabled' : 'Disabled') + '</span></td>' +
           '<td><div class="small-actions">' +
           '<button class="icon-btn" data-act="gw-check" data-id="' + g.id + '">Check</button>' +
+           (String(g.worker_name || '').indexOf('nexus-gw-') === 0 ? '<button class="icon-btn" data-act="gw-redeploy" data-id="' + g.id + '">Redeploy</button>' : '') +
           '<button class="icon-btn" data-act="gw-edit" data-id="' + g.id + '">Edit</button>' +
           '<button class="icon-btn" data-act="gw-toggle" data-id="' + g.id + '">' + (on ? 'Disable' : 'Enable') + '</button>' +
           '<button class="icon-btn danger" data-act="gw-delete" data-id="' + g.id + '">Delete</button>' +
@@ -2705,21 +2882,23 @@ select option{background:#0c1422;color:#fff}
       '<div class="field"><label>Region label</label><input id="gRegion" value="' + esc(g.region || '') + '" placeholder="eu"></div>' +
       '<div class="field" style="grid-column:1/-1"><label>Host (domain users connect to - leave empty for this worker)</label>' +
       '<input id="gHost" value="' + esc(g.worker_url || '') + '" placeholder="' + esc(location.host) + '"></div>' +
-      '</div><div class="muted" style="margin-top:12px">A custom domain must be routed to this same worker. Each gateway has its own path <span class="mono">/ws/&lt;id&gt;</span> so users can be pinned to it.</div></div>' +
+      '</div>' + (edit ? '' : '<label style="display:flex;gap:8px;align-items:center;margin-top:14px"><input type="checkbox" id="gDeploy"> Deploy as its own Worker (workers.dev)</label>') +
+      '<div class="muted" style="margin-top:12px">A custom domain must be routed
       '<div class="modal-foot"><button class="btn" data-act="close">Cancel</button><button class="btn primary" data-act="gw-save">' + (edit ? 'Save' : 'Create') + '</button></div>'
     );
   }
 
-  function saveGateway() {
+    function saveGateway() {
     var id = val('gId'), name = val('gName').trim();
     if (!name) { toast('Gateway name is required'); return; }
+    var dep = $('gDeploy') && $('gDeploy').checked;
+    if (dep) toast('Deploying Worker, please wait...');
     api(id ? '/api/gateways/' + id : '/api/gateways', {
       method: id ? 'PUT' : 'POST',
-      body: { name: name, region: val('gRegion').trim() || 'default', host: val('gHost').trim() }
+      body: { name: name, region: val('gRegion').trim() || 'default', host: val('gHost').trim(), deploy: !!dep }
     }).then(function () { closeModal(); toast('Gateway saved'); loadGateways(); })
       .catch(function (e) { toast(e.message); });
   }
-
   function checkGateway(id) {
     var g = findBy(S.gateways, id); if (!g) return;
     var host = g.worker_url || location.host;
@@ -2928,12 +3107,23 @@ select option{background:#0c1422;color:#fff}
       '<div class="actions"><button class="btn primary" data-act="tg-on">Save &amp; Activate</button>' +
       '<button class="btn" data-act="tg-save">Save only</button>' +
       '<button class="btn" data-act="tg-off">Deactivate</button></div></div></div>' +
+      '<div class="card" style="margin-top:14px"><div class="card-label">Worker gateways (Cloudflare API)</div>' +
+      '<div id="cfdStatus" style="margin-top:8px"></div>' +
+      '<div class="muted" style="margin-top:6px">Lets the panel deploy every new gateway as its own Worker on workers.dev. Token permissions: Account Settings Read, Workers Scripts Edit, D1 Read. Account and database are auto-detected when empty.</div>' +
+      '<div style="margin-top:12px;display:grid;gap:10px;max-width:560px">' +
+      '<div class="field"><label>API token</label><input id="cfdToken" type="password" autocomplete="off" placeholder="Cloudflare API token"></div>' +
+      '<div class="field"><label>Account ID (optional)</label><input id="cfdAccount"></div>' +
+      '<div class="field"><label>D1 database ID (optional)</label><input id="cfdDb"></div>' +
+      '<div class="field"><label>Panel code URL (raw _worker.js)</label><input id="cfdSource"></div>' +
+      '<div class="actions"><button class="btn primary" data-act="cfd-save">Save</button>' +
+      '<button class="btn" data-act="cfd-clear">Remove token</button></div></div></div>' +
       '</div></div>';
     api('/api/settings').then(function (d) {
       $('proxyIp').value = d.settings.proxy_ip || '';
       if (d.env_proxy_ip) $('proxyEnv').textContent = 'PROXYIP env var is set and takes priority: ' + d.env_proxy_ip;
     }).catch(function () {});
     loadTg();
+    loadCfd();
   }
     
   function changePw() {
@@ -2969,6 +3159,27 @@ select option{background:#0c1422;color:#fff}
       })
       .catch(function (e) { toast(e.message); });
   }
+
+    function loadCfd() {
+    api('/api/cfdeploy').then(function (d) {
+      var c = d.cfd;
+      $('cfdAccount').value = c.account_id || '';
+      $('cfdDb').value = c.db_id || '';
+      $('cfdSource').value = c.source || '';
+      $('cfdToken').placeholder = c.token_set ? (c.from_env ? 'Set via environment variable' : 'Saved (leave empty to keep)') : 'Cloudflare API token';
+      $('cfdStatus').innerHTML = (c.token_set && c.account_id && c.db_id)
+        ? '<span class="badge green">&#9679; Ready</span>'
+        : '<span class="badge yellow">Not configured</span>';
+    }).catch(function () {});
+  }
+
+  function cfdSave() {
+    api('/api/cfdeploy', { method: 'POST', body: {
+      token: val('cfdToken').trim(), account_id: val('cfdAccount').trim(),
+      db_id: val('cfdDb').trim(), source: val('cfdSource').trim()
+    } }).then(function () { $('cfdToken').value = ''; toast('Saved'); loadCfd(); })
+      .catch(function (e) { toast(e.message); });
+  }
   /* ---------- events ---------- */
 
   function confirmDo(msg, fn) { if (confirm(msg)) fn(); }
@@ -2992,7 +3203,19 @@ select option{background:#0c1422;color:#fff}
     'user-toggle': function (id) { simple('PATCH', '/api/accounts/' + id, '', pUsers); },
     'user-reset': function (id) { confirmDo('Reset traffic for this user?', function () { simple('POST', '/api/accounts/' + id + '/reset', 'Traffic reset', pUsers); }); },
     'user-delete': function (id) { confirmDo('Delete this user and their subscriptions?', function () { simple('DELETE', '/api/accounts/' + id, 'User deleted', pUsers); }); },
-
+    
+    'cfd-save': cfdSave,
+    'cfd-clear': function () {
+      api('/api/cfdeploy', { method: 'POST', body: { clear: true } })
+        .then(function () { toast('Removed'); loadCfd(); })
+        .catch(function (e) { toast(e.message); });
+    },
+    'gw-redeploy': function (id) {
+      toast('Redeploying...');
+      api('/api/gateways/' + id + '/redeploy', { method: 'POST' })
+        .then(function () { toast('Worker updated'); })
+        .catch(function (e) { toast(e.message); });
+    }
     'gw-new': function () { gwModal(null); },
     'gw-edit': function (id) { var g = findBy(S.gateways, id); if (g) gwModal(g); },
     'gw-save': saveGateway,
