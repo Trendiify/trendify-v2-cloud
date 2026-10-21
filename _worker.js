@@ -1,14 +1,20 @@
 /*
  * Trendify Nexus - single Worker edition
- * Panel + Gateways + Subscriptions + Configs + VLESS/WS proxy, all in ONE worker.
+ * Panel + Gateways + Subscriptions + Configs + VLESS/WS proxy, all in ONE script.
+ *
+ * Deployment model:
+ *   - The PANEL runs on Cloudflare Pages (this file as _worker.js, advanced mode).
+ *   - Every GATEWAY created with "Deploy as its own Worker" is uploaded through the
+ *     Cloudflare API as a standalone Worker (nexus-gw-xxxx) running the same code
+ *     (downloaded from the "Panel code URL") and bound to the same D1 database.
  *
  * Setup:
  *   1) Bind a D1 database with the binding name:  DB
  *   2) (optional) env vars:  ADMIN_PASSWORD  (first-run admin password, default "admin")
  *                            PROXYIP         (fallback proxy "host" or "host:port", comma separated)
- *   3) Deploy, open the worker URL, login admin / admin (change it in Settings).
- *
- * No CF_TOKEN / CF_ACCOUNT_ID / extra workers are needed anymore.
+ *                            CF_API_TOKEN / CF_ACCOUNT_ID / CF_DB_ID  (for Worker gateways,
+ *                            otherwise configure them in Settings)
+ *   3) Deploy, open the URL, login admin / admin (change it in Settings).
  */
 import { connect } from "cloudflare:sockets";
 
@@ -432,6 +438,7 @@ export default {
 
       await init(env, url.host);
       if (path === "/tg/webhook" && method === "POST") return await tgWebhook(request, env, ctx, url);
+
       // public subscription
       const sub = path.match(/^\/sub\/([^/]+)$/);
       if (sub && method === "GET") {
@@ -490,11 +497,13 @@ export default {
         if (method === "DELETE") return await deleteGateway(id, env);
       }
       m = path.match(/^\/api\/gateways\/(\d+)\/health-result$/);
+      if (m && method === "POST") return await saveHealth(Number(m[1]), request, env);
       m = path.match(/^\/api\/gateways\/(\d+)\/redeploy$/);
       if (m && method === "POST") return await redeployGateway(Number(m[1]), env);
+
+      // Cloudflare worker-gateway deployment settings
       if (path === "/api/cfdeploy" && method === "GET") return await cfdGet(env);
       if (path === "/api/cfdeploy" && method === "POST") return await cfdSave(request, env);
-      if (m && method === "POST") return await saveHealth(Number(m[1]), request, env);
 
       // subscriptions
       if (path === "/api/subscriptions" && method === "GET") return await getSubscriptions(env);
@@ -548,10 +557,13 @@ export default {
         await setSetting(env, "proxy_ip", v);
         return json({ success: true });
       }
+
+      // telegram
       if (path === "/api/telegram" && method === "GET") return await tgGetSettings(env, url);
       if (path === "/api/telegram" && method === "POST") return await tgSaveSettings(request, env);
       if (path === "/api/telegram/activate" && method === "POST") return await tgActivate(env, url);
       if (path === "/api/telegram/deactivate" && method === "POST") return await tgDeactivate(env);
+
       return json({ success: false, error: "Not Found" }, 404);
     } catch (error) {
       console.log("Nexus error:", error && error.message ? error.message : String(error));
@@ -991,7 +1003,7 @@ async function publicSubscription(token, env, url) {
 }
 
 /* ------------------------------------------------------------------ */
-/* gateways (logical entries; every gateway is served by this worker)  */
+/* gateways                                                            */
 /* ------------------------------------------------------------------ */
 
 async function getGateways(env) {
@@ -1048,6 +1060,7 @@ async function createGateway(request, env, url) {
     gateway: { id: r.meta && r.meta.last_row_id, name: f.name, host, region: f.region }
   });
 }
+
 async function updateGateway(id, request, env, url) {
   const body = await readJson(request);
   if (!body) return json({ success: false, error: "Invalid JSON" }, 400);
@@ -1072,7 +1085,7 @@ async function toggleGateway(id, env) {
   return json({ success: true, enabled });
 }
 
-aasync function deleteGateway(id, env) {
+async function deleteGateway(id, env) {
   const g = await env.DB.prepare("SELECT worker_name FROM gateways WHERE id = ? LIMIT 1").bind(id).first();
   await env.DB.batch([
     env.DB.prepare("UPDATE accounts SET gateway_id = NULL WHERE gateway_id = ?").bind(id),
@@ -1397,7 +1410,7 @@ function handleVLESS(request, env, ctx, pathGatewayId) {
     e.quiet = !!quiet;
     throw e;
   };
- 
+
   // send bytes to the client, prefixing the VLESS response header once
   const send = (chunk) => {
     if (closed || server.readyState !== 1) return;
@@ -1566,7 +1579,6 @@ function handleVLESS(request, env, ctx, pathGatewayId) {
   }
 
   server.addEventListener("message", (event) => {
-    
     chain = chain
       .then(async () => {
         if (closed) return;
@@ -1596,6 +1608,7 @@ function handleVLESS(request, env, ctx, pathGatewayId) {
 
   return new Response(null, { status: 101, webSocket: client });
 }
+
 /* ------------------------------------------------------------------ */
 /* Telegram bot                                                        */
 /* ------------------------------------------------------------------ */
@@ -2295,6 +2308,7 @@ async function tgOnText(env, t, st, text) {
   await tgClearState(env, t.uid);
   return tgMain(t);
 }
+
 /* ------------------------------------------------------------------ */
 /* Worker gateways (deployed through the Cloudflare API)               */
 /* ------------------------------------------------------------------ */
@@ -2446,6 +2460,7 @@ async function redeployGateway(id, env) {
   }
   return json({ success: true });
 }
+
 /* ------------------------------------------------------------------ */
 /* panel UI                                                            */
 /* ------------------------------------------------------------------ */
@@ -2653,13 +2668,12 @@ select option{background:#0c1422;color:#fff}
       if (el) el.innerHTML = '<div class="empty">' + esc(e.message || 'Failed') + '</div>';
     };
   }
-    
 
   function val(id) { var el = $(id); return el ? el.value : ''; }
 
   /* ---------- login / shell ---------- */
 
-      function showLogin() {
+  function showLogin() {
     closeModal();
     root.innerHTML =
       '<div class="login-wrap"><div class="login-box"><div class="login-logo"></div><h1>Trendify Nexus</h1><p>Cloudflare Control Panel</p>' +
@@ -2712,7 +2726,7 @@ select option{background:#0c1422;color:#fff}
       '<div id="warnBox"></div><div class="cards" id="statCards"><div class="empty">Loading...</div></div>' +
       '<div class="panel" style="margin-top:18px"><div class="panel-head"><div class="panel-title">System Status</div></div>' +
       '<div class="pad"><span class="badge green">&#9679; Nexus Online</span>' +
-      '<div class="muted" style="margin-top:12px">Panel, gateways, subscriptions and the VLESS endpoint all run inside this Worker.<br>WebSocket path: <span class="mono">/ws/&lt;gatewayId&gt;</span> &middot; Host: <span class="mono">' + esc(location.host) + '</span></div></div></div>';
+      '<div class="muted" style="margin-top:12px">Panel, gateways, subscriptions and the VLESS endpoint all run from this code.<br>WebSocket path: <span class="mono">/ws/&lt;gatewayId&gt;</span> &middot; Host: <span class="mono">' + esc(location.host) + '</span></div></div></div>';
     api('/api/auth/me').then(function (me) {
       if (me.default_password) {
         $('warnBox').innerHTML = '<div class="warn">You are still using the default admin password. Go to Settings and change it now.</div>';
@@ -2827,7 +2841,7 @@ select option{background:#0c1422;color:#fff}
           '<textarea readonly>' + esc(l.link) + '</textarea>' +
           '<div><button class="icon-btn" data-act="copy" data-val="' + esc(l.link) + '">Copy</button></div></div>';
       });
-      h += '<div class="muted">The first link connects directly to your worker. Other links use the top IPs from the Scanner page.</div></div>' +
+      h += '<div class="muted">The first link connects directly to the gateway host. Other links use the top IPs from the Scanner page.</div></div>' +
         '<div class="modal-foot"><button class="btn" data-act="close">Close</button></div>';
       openModal(h);
     }).catch(function (e) { toast(e.message); });
@@ -2836,7 +2850,7 @@ select option{background:#0c1422;color:#fff}
   /* ---------- gateways ---------- */
 
   function pGateways() {
-    $('view').innerHTML = hdr('Gateways', 'Entry points served by this worker', '<button class="btn primary" data-act="gw-new">+ Create Gateway</button>') +
+    $('view').innerHTML = hdr('Gateways', 'Entry points for your users', '<button class="btn primary" data-act="gw-new">+ Create Gateway</button>') +
       '<div class="panel"><div id="gwTable"><div class="empty">Loading...</div></div></div>' +
       '<div class="panel"><div class="panel-head"><div class="panel-title">Connection Logs</div><div class="actions">' +
       '<button class="icon-btn" data-act="logs-refresh">Refresh</button><button class="icon-btn danger" data-act="logs-clear">Clear</button></div></div>' +
@@ -2862,7 +2876,7 @@ select option{background:#0c1422;color:#fff}
           '<td><span class="badge ' + (on ? 'green' : 'red') + '">' + (on ? 'Enabled' : 'Disabled') + '</span></td>' +
           '<td><div class="small-actions">' +
           '<button class="icon-btn" data-act="gw-check" data-id="' + g.id + '">Check</button>' +
-           (String(g.worker_name || '').indexOf('nexus-gw-') === 0 ? '<button class="icon-btn" data-act="gw-redeploy" data-id="' + g.id + '">Redeploy</button>' : '') +
+          (String(g.worker_name || '').indexOf('nexus-gw-') === 0 ? '<button class="icon-btn" data-act="gw-redeploy" data-id="' + g.id + '">Redeploy</button>' : '') +
           '<button class="icon-btn" data-act="gw-edit" data-id="' + g.id + '">Edit</button>' +
           '<button class="icon-btn" data-act="gw-toggle" data-id="' + g.id + '">' + (on ? 'Disable' : 'Enable') + '</button>' +
           '<button class="icon-btn danger" data-act="gw-delete" data-id="' + g.id + '">Delete</button>' +
@@ -2883,12 +2897,12 @@ select option{background:#0c1422;color:#fff}
       '<div class="field" style="grid-column:1/-1"><label>Host (domain users connect to - leave empty for this worker)</label>' +
       '<input id="gHost" value="' + esc(g.worker_url || '') + '" placeholder="' + esc(location.host) + '"></div>' +
       '</div>' + (edit ? '' : '<label style="display:flex;gap:8px;align-items:center;margin-top:14px"><input type="checkbox" id="gDeploy"> Deploy as its own Worker (workers.dev)</label>') +
-      '<div class="muted" style="margin-top:12px">A custom domain must be routed
+      '<div class="muted" style="margin-top:12px">When "Deploy as its own Worker" is checked, the gateway is created on Cloudflare Workers automatically and its workers.dev host is used. A custom domain must be routed to a Worker that runs this same code.</div></div>' +
       '<div class="modal-foot"><button class="btn" data-act="close">Cancel</button><button class="btn primary" data-act="gw-save">' + (edit ? 'Save' : 'Create') + '</button></div>'
     );
   }
 
-    function saveGateway() {
+  function saveGateway() {
     var id = val('gId'), name = val('gName').trim();
     if (!name) { toast('Gateway name is required'); return; }
     var dep = $('gDeploy') && $('gDeploy').checked;
@@ -2899,6 +2913,7 @@ select option{background:#0c1422;color:#fff}
     }).then(function () { closeModal(); toast('Gateway saved'); loadGateways(); })
       .catch(function (e) { toast(e.message); });
   }
+
   function checkGateway(id) {
     var g = findBy(S.gateways, id); if (!g) return;
     var host = g.worker_url || location.host;
@@ -3086,7 +3101,7 @@ select option{background:#0c1422;color:#fff}
   function pSettings() {
     $('view').innerHTML = hdr('Settings', 'Nexus configuration', '') +
       '<div class="panel"><div class="panel-head"><div class="panel-title">Infrastructure</div></div><div class="pad">' +
-      '<div class="card"><div class="card-label">Architecture</div><div style="margin-top:10px;line-height:1.8;color:#aab5c8">Nexus Worker (panel + API + subscriptions + VLESS/WebSocket) &rarr; D1</div></div>' +
+      '<div class="card"><div class="card-label">Architecture</div><div style="margin-top:10px;line-height:1.8;color:#aab5c8">Panel (Pages) + Worker gateways (VLESS/WebSocket) &rarr; shared D1</div></div>' +
       '<div class="card" style="margin-top:14px"><div class="card-label">Fallback proxy (optional)</div>' +
       '<div class="muted" style="margin-top:6px">Used only when a direct outbound connection fails (for example targets behind Cloudflare). Format: host or host:port, comma separated.</div>' +
       '<div class="row" style="margin-top:10px;max-width:560px"><div class="field" style="flex:1"><input id="proxyIp" placeholder="proxy.example.com"></div>' +
@@ -3096,7 +3111,7 @@ select option{background:#0c1422;color:#fff}
       '<div class="field"><label>Current password</label><input id="curPw" type="password" autocomplete="current-password"></div>' +
       '<div class="field"><label>New password (min 8 chars)</label><input id="newPw" type="password" autocomplete="new-password"></div>' +
       '<div class="field"><label>Confirm new password</label><input id="newPw2" type="password" autocomplete="new-password"></div>' +
-            '<button id="pwBtn" class="btn primary" type="submit">Change Password</button></form></div>' +
+      '<button id="pwBtn" class="btn primary" type="submit">Change Password</button></form></div>' +
       '<div class="card" style="margin-top:14px"><div class="card-label">Telegram Bot</div>' +
       '<div id="tgStatus" style="margin-top:8px"></div>' +
       '<div class="muted" style="margin-top:6px">Create a bot with @BotFather and paste its token. Admin IDs are numeric Telegram IDs (comma separated). If you do not know yours, activate the bot, send it /start and it will show your ID.</div>' +
@@ -3125,7 +3140,7 @@ select option{background:#0c1422;color:#fff}
     loadTg();
     loadCfd();
   }
-    
+
   function changePw() {
     var a = val('curPw'), b = val('newPw'), c = val('newPw2');
     if (b !== c) { toast('New passwords do not match'); return; }
@@ -3136,6 +3151,7 @@ select option{background:#0c1422;color:#fff}
       .catch(function (e) { toast(e.message); })
       .then(function () { btn.disabled = false; });
   }
+
   function loadTg() {
     api('/api/telegram').then(function (d) {
       var t = d.telegram;
@@ -3160,7 +3176,7 @@ select option{background:#0c1422;color:#fff}
       .catch(function (e) { toast(e.message); });
   }
 
-    function loadCfd() {
+  function loadCfd() {
     api('/api/cfdeploy').then(function (d) {
       var c = d.cfd;
       $('cfdAccount').value = c.account_id || '';
@@ -3180,6 +3196,7 @@ select option{background:#0c1422;color:#fff}
     } }).then(function () { $('cfdToken').value = ''; toast('Saved'); loadCfd(); })
       .catch(function (e) { toast(e.message); });
   }
+
   /* ---------- events ---------- */
 
   function confirmDo(msg, fn) { if (confirm(msg)) fn(); }
@@ -3203,19 +3220,20 @@ select option{background:#0c1422;color:#fff}
     'user-toggle': function (id) { simple('PATCH', '/api/accounts/' + id, '', pUsers); },
     'user-reset': function (id) { confirmDo('Reset traffic for this user?', function () { simple('POST', '/api/accounts/' + id + '/reset', 'Traffic reset', pUsers); }); },
     'user-delete': function (id) { confirmDo('Delete this user and their subscriptions?', function () { simple('DELETE', '/api/accounts/' + id, 'User deleted', pUsers); }); },
-    
+
     'cfd-save': cfdSave,
     'cfd-clear': function () {
       api('/api/cfdeploy', { method: 'POST', body: { clear: true } })
         .then(function () { toast('Removed'); loadCfd(); })
         .catch(function (e) { toast(e.message); });
     },
+
     'gw-redeploy': function (id) {
       toast('Redeploying...');
       api('/api/gateways/' + id + '/redeploy', { method: 'POST' })
         .then(function () { toast('Worker updated'); })
         .catch(function (e) { toast(e.message); });
-    }
+    },
     'gw-new': function () { gwModal(null); },
     'gw-edit': function (id) { var g = findBy(S.gateways, id); if (g) gwModal(g); },
     'gw-save': saveGateway,
@@ -3246,15 +3264,15 @@ select option{background:#0c1422;color:#fff}
     'proxy-save': function () {
       api('/api/settings', { method: 'POST', body: { proxy_ip: val('proxyIp').trim() } })
         .then(function () { toast('Saved'); }).catch(function (e) { toast(e.message); });
-    }
-        ,
+    },
+
     'tg-save': function () { tgSave(false); },
     'tg-on': function () { tgSave(true); },
     'tg-off': function () {
       api('/api/telegram/deactivate', { method: 'POST' })
         .then(function () { toast('Bot deactivated'); loadTg(); })
         .catch(function (e) { toast(e.message); });
-    }    
+    }
   };
 
   document.addEventListener('click', function (e) {
@@ -3275,7 +3293,7 @@ select option{background:#0c1422;color:#fff}
 
   api('/api/auth/me').then(function (me) { S.me = me; showShell(); }).catch(function () { showLogin(); });
 })();
-</script> 
+</script>
 </body>
 </html>`;
 }
