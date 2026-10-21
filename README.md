@@ -25,7 +25,11 @@ All-in-one control panel for Cloudflare
 ![No server](https://img.shields.io/badge/Servers-0-success)
 
 </div>
+<div align="center">
 
+<img src="[screenshots/dashboard.png](https://github.com/Trendiify/trendify-v2-cloud/blob/main/logo/t2png.png)" alt="Trendify Nexus Dashboard" width="800">
+
+</div>
 ---
 
 <a id="persian"></a>
