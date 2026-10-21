@@ -27,7 +27,7 @@ All-in-one control panel for Cloudflare
 </div>
 <div align="center">
 
-<img src="logo/t2png.png" alt="Trendify Nexus" width="800">
+<img src="logo/t2png.png" alt="Trendify Nexus" width="300">
 
 </div>
 ---
